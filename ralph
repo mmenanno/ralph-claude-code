@@ -1,0 +1,621 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Configuration
+BRIEF_FILE="BRIEF.md"
+WORKLOG_FILE="WORKLOG.md"
+COMPLETION_MARKER="<promise>COMPLETE</promise>"
+
+# Defaults
+MAX_ITERATIONS=10
+SLEEP_SECONDS=3
+VERBOSE=false
+QUIET=false
+DRY_RUN=false
+NO_LIMIT=false
+NO_SLEEP=false
+RESET_WORKLOG=false
+KEEP_WORKLOG=false
+CLEANUP=false
+FORCE=false
+ADD_GITIGNORE=false
+SKIP_GITIGNORE=false
+OUTPUT_PROMPT=false
+
+# Colors (disable with NO_COLOR env var)
+if [[ -z "${NO_COLOR:-}" ]]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[0;33m'
+    BLUE=$'\033[0;34m'
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    RESET=$'\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' BOLD='' DIM='' RESET=''
+fi
+
+# Signal trap for clean interruption
+trap 'echo ""; echo -e "${BLUE}→${RESET} Interrupted by user"; exit 130' INT TERM
+
+usage() {
+    cat <<EOF
+${BOLD}${BLUE}ralph${RESET} - Autonomous coding agent loop
+
+${BOLD}${YELLOW}USAGE${RESET}
+    ralph [OPTIONS]
+
+${BOLD}${YELLOW}OPTIONS${RESET}
+    ${GREEN}-n${RESET}, ${GREEN}--max${RESET} NUM       Maximum iterations (default: $MAX_ITERATIONS)
+    ${GREEN}-u${RESET}, ${GREEN}--unlimited${RESET}     No iteration limit (run until complete)
+    ${GREEN}-s${RESET}, ${GREEN}--sleep${RESET} SECS    Seconds between iterations (default: $SLEEP_SECONDS)
+    ${GREEN}-S${RESET}, ${GREEN}--no-sleep${RESET}      Disable sleep between iterations
+    ${GREEN}-r${RESET}, ${GREEN}--reset${RESET}         Reset worklog (don't prompt, just overwrite)
+    ${GREEN}-k${RESET}, ${GREEN}--keep${RESET}          Keep existing worklog (don't prompt, just continue)
+    ${GREEN}-c${RESET}, ${GREEN}--cleanup${RESET}       Delete BRIEF.md and WORKLOG.md (with confirmation)
+    ${GREEN}-f${RESET}, ${GREEN}--force${RESET}         Skip confirmation prompts (use with --cleanup)
+    ${GREEN}-g${RESET}, ${GREEN}--add-gitignore${RESET} Auto-add workflow files to .gitignore
+    ${GREEN}-G${RESET}, ${GREEN}--skip-gitignore${RESET} Skip the gitignore check entirely
+    ${GREEN}-v${RESET}, ${GREEN}--verbose${RESET}       Show additional debug information
+    ${GREEN}-q${RESET}, ${GREEN}--quiet${RESET}         Suppress banner and configuration output
+    ${GREEN}-d${RESET}, ${GREEN}--dry-run${RESET}       Preview execution without running claude
+    ${GREEN}-P${RESET}, ${GREEN}--prompt${RESET}        Output the prompt and exit (for debugging)
+    ${GREEN}-h${RESET}, ${GREEN}--help${RESET}          Show this help message
+
+${BOLD}${YELLOW}DESCRIPTION${RESET}
+    Ralph reads ${BLUE}${BRIEF_FILE}${RESET} to find incomplete tasks, implements ONE task per
+    iteration, and logs progress to ${BLUE}${WORKLOG_FILE}${RESET}. The loop continues until
+    all tasks are complete or max iterations is reached.
+
+${BOLD}${YELLOW}WORKFLOW${RESET}
+    1. Create ${BLUE}${BRIEF_FILE}${RESET} with tasks (use /brief skill to generate)
+    2. Run: ${GREEN}ralph${RESET}
+    3. Ralph works through tasks, committing as it goes
+    4. Check ${BLUE}${WORKLOG_FILE}${RESET} for iteration history
+
+${BOLD}${YELLOW}EXAMPLES${RESET}
+    ${GREEN}ralph${RESET}                    ${DIM}# Run with defaults (10 iterations, 3s sleep)${RESET}
+    ${GREEN}ralph -n 20${RESET}              ${DIM}# Run up to 20 iterations${RESET}
+    ${GREEN}ralph -u${RESET}                 ${DIM}# Run unlimited until complete${RESET}
+    ${GREEN}ralph -s 5${RESET}               ${DIM}# 5 second pause between iterations${RESET}
+    ${GREEN}ralph -S${RESET}                 ${DIM}# No pause between iterations${RESET}
+    ${GREEN}ralph -r${RESET}                 ${DIM}# Reset worklog and start fresh${RESET}
+    ${GREEN}ralph -k${RESET}                 ${DIM}# Keep existing worklog and continue${RESET}
+    ${GREEN}ralph --cleanup${RESET}          ${DIM}# Delete workflow files after completion${RESET}
+    ${GREEN}ralph --cleanup -f${RESET}       ${DIM}# Delete without confirmation${RESET}
+    ${GREEN}ralph --add-gitignore${RESET}    ${DIM}# Auto-add workflow files to .gitignore${RESET}
+    ${GREEN}ralph --skip-gitignore${RESET}   ${DIM}# Skip gitignore check${RESET}
+    ${GREEN}ralph -q${RESET}                 ${DIM}# Run with minimal output${RESET}
+    ${GREEN}ralph -d${RESET}                 ${DIM}# Preview without executing claude${RESET}
+    ${GREEN}ralph -P${RESET}                 ${DIM}# Output prompt for interactive debugging${RESET}
+
+${BOLD}${YELLOW}EXIT CODES${RESET}
+    ${GREEN}0${RESET}     All tasks completed successfully
+    ${GREEN}1${RESET}     Error or max iterations reached
+    ${GREEN}130${RESET}   Interrupted by user (Ctrl+C)
+
+${BOLD}${YELLOW}FILES${RESET}
+    ${BLUE}${BRIEF_FILE}${RESET}        Task specification (required)
+    ${BLUE}${WORKLOG_FILE}${RESET}      Progress log (created if missing)
+    ${BLUE}CLAUDE.md${RESET}       Project patterns (optional, updated by ralph)
+
+EOF
+}
+
+log() {
+    echo -e "${DIM}[ralph]${RESET} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}✓${RESET} $1"
+}
+
+log_error() {
+    echo -e "${RED}✗${RESET} $1" >&2
+}
+
+log_info() {
+    echo -e "${BLUE}→${RESET} $1"
+}
+
+create_fresh_worklog() {
+    cat > "$WORKLOG_FILE" <<EOF
+# Work Log
+
+## Learnings
+(Patterns discovered during implementation)
+
+---
+EOF
+}
+
+check_gitignore() {
+    local missing_files=()
+    local gitignore_file=".gitignore"
+
+    # Check which workflow files are missing from gitignore
+    if [[ -f "$gitignore_file" ]]; then
+        # Check each file - use grep -Fx for exact line match
+        if ! grep -Fxq "$BRIEF_FILE" "$gitignore_file" 2>/dev/null; then
+            missing_files+=("$BRIEF_FILE")
+        fi
+        if ! grep -Fxq "$WORKLOG_FILE" "$gitignore_file" 2>/dev/null; then
+            missing_files+=("$WORKLOG_FILE")
+        fi
+
+        # If nothing is missing, we're good
+        if [[ ${#missing_files[@]} -eq 0 ]]; then
+            return 0
+        fi
+
+        # Auto-add if --add-gitignore flag is set
+        if [[ "$ADD_GITIGNORE" == true ]]; then
+            for file in "${missing_files[@]}"; do
+                echo "$file" >> "$gitignore_file"
+            done
+            log_success "Added ${missing_files[*]} to .gitignore"
+            return 0
+        fi
+
+        # Prompt user about missing entries
+        echo -e "${YELLOW}Workflow files not in .gitignore:${RESET}"
+        for file in "${missing_files[@]}"; do
+            echo "  - $file"
+        done
+        echo ""
+        echo "  [a] Add them to .gitignore"
+        echo "  [s] Skip (continue without adding)"
+        echo ""
+        read -p "Choice [a/s]: " -n 1 -r choice
+        echo ""
+
+        case $choice in
+            a|A)
+                for file in "${missing_files[@]}"; do
+                    echo "$file" >> "$gitignore_file"
+                done
+                log_success "Added ${missing_files[*]} to .gitignore"
+                ;;
+            *)
+                log_info "Skipping gitignore update"
+                ;;
+        esac
+    else
+        # Auto-create if --add-gitignore flag is set
+        if [[ "$ADD_GITIGNORE" == true ]]; then
+            echo "$BRIEF_FILE" > "$gitignore_file"
+            echo "$WORKLOG_FILE" >> "$gitignore_file"
+            log_success "Created .gitignore with $BRIEF_FILE and $WORKLOG_FILE"
+            return 0
+        fi
+
+        # No .gitignore exists - prompt to create one
+        echo -e "${YELLOW}.gitignore not found${RESET}"
+        echo ""
+        echo "  [c] Create .gitignore with workflow files ($BRIEF_FILE, $WORKLOG_FILE)"
+        echo "  [s] Skip (continue without creating)"
+        echo ""
+        read -p "Choice [c/s]: " -n 1 -r choice
+        echo ""
+
+        case $choice in
+            c|C)
+                echo "$BRIEF_FILE" > "$gitignore_file"
+                echo "$WORKLOG_FILE" >> "$gitignore_file"
+                log_success "Created .gitignore with $BRIEF_FILE and $WORKLOG_FILE"
+                ;;
+            *)
+                log_info "Skipping .gitignore creation"
+                ;;
+        esac
+    fi
+    echo ""
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -n|--max)
+            MAX_ITERATIONS="$2"
+            shift 2
+            ;;
+        -u|--unlimited)
+            NO_LIMIT=true
+            shift
+            ;;
+        -s|--sleep)
+            SLEEP_SECONDS="$2"
+            shift 2
+            ;;
+        -S|--no-sleep)
+            NO_SLEEP=true
+            shift
+            ;;
+        -r|--reset)
+            RESET_WORKLOG=true
+            shift
+            ;;
+        -k|--keep)
+            KEEP_WORKLOG=true
+            shift
+            ;;
+        -c|--cleanup)
+            CLEANUP=true
+            shift
+            ;;
+        -f|--force)
+            FORCE=true
+            shift
+            ;;
+        -g|--add-gitignore)
+            ADD_GITIGNORE=true
+            shift
+            ;;
+        -G|--skip-gitignore)
+            SKIP_GITIGNORE=true
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -q|--quiet)
+            QUIET=true
+            shift
+            ;;
+        -d|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -P|--prompt)
+            OUTPUT_PROMPT=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            log_error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# Check for mutually exclusive flags
+if [[ "$KEEP_WORKLOG" == true ]] && [[ "$RESET_WORKLOG" == true ]]; then
+    log_error "--keep and --reset are mutually exclusive"
+    exit 1
+fi
+
+# Check for mutually exclusive gitignore flags
+if [[ "$ADD_GITIGNORE" == true ]] && [[ "$SKIP_GITIGNORE" == true ]]; then
+    log_error "--add-gitignore and --skip-gitignore are mutually exclusive"
+    exit 1
+fi
+
+# Warn if --force is used without --cleanup
+if [[ "$FORCE" == true ]] && [[ "$CLEANUP" == false ]]; then
+    log_info "--force has no effect without --cleanup"
+fi
+
+# Handle cleanup command
+if [[ "$CLEANUP" == true ]]; then
+    deleted_files=()
+
+    if [[ ! -f "$BRIEF_FILE" ]] && [[ ! -f "$WORKLOG_FILE" ]]; then
+        log_info "No workflow files to delete"
+        exit 0
+    fi
+
+    # Skip confirmation if --force is set
+    if [[ "$FORCE" == false ]]; then
+        # Prompt for confirmation
+        echo -e "${YELLOW}This will delete workflow files:${RESET}"
+        [[ -f "$BRIEF_FILE" ]] && echo "  - $BRIEF_FILE"
+        [[ -f "$WORKLOG_FILE" ]] && echo "  - $WORKLOG_FILE"
+
+        echo ""
+        read -p "Are you sure? [y/N]: " -n 1 -r confirm
+        echo ""
+
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            log_info "Cleanup cancelled"
+            exit 0
+        fi
+    fi
+
+    # Delete files
+    if [[ -f "$BRIEF_FILE" ]]; then
+        rm "$BRIEF_FILE"
+        deleted_files+=("$BRIEF_FILE")
+    fi
+    if [[ -f "$WORKLOG_FILE" ]]; then
+        rm "$WORKLOG_FILE"
+        deleted_files+=("$WORKLOG_FILE")
+    fi
+
+    # Report results
+    if [[ ${#deleted_files[@]} -gt 0 ]]; then
+        log_success "Deleted: ${deleted_files[*]}"
+    fi
+    exit 0
+fi
+
+# Validate inputs (skip if just outputting prompt)
+if [[ "$OUTPUT_PROMPT" == false ]]; then
+    if [[ "$NO_LIMIT" == false ]]; then
+        if ! [[ "$MAX_ITERATIONS" =~ ^[0-9]+$ ]] || [[ "$MAX_ITERATIONS" -lt 1 ]]; then
+            log_error "Max iterations must be a positive integer"
+            exit 1
+        fi
+    fi
+
+    if [[ "$NO_SLEEP" == false ]] && ! [[ "$SLEEP_SECONDS" =~ ^[0-9]+$ ]]; then
+        log_error "Sleep seconds must be a non-negative integer"
+        exit 1
+    fi
+fi
+
+# Check gitignore for workflow files (skip in dry-run mode, --skip-gitignore, or --prompt)
+if [[ "$DRY_RUN" == false ]] && [[ "$SKIP_GITIGNORE" == false ]] && [[ "$OUTPUT_PROMPT" == false ]]; then
+    check_gitignore
+fi
+
+# Check for required files (skip if just outputting prompt)
+if [[ "$OUTPUT_PROMPT" == false ]] && [[ ! -f "$BRIEF_FILE" ]]; then
+    log_error "${BRIEF_FILE} not found in current directory"
+    echo ""
+    echo "Create a brief first using: /brief"
+    echo "Or create ${BRIEF_FILE} manually with tasks formatted as:"
+    echo "  - [ ] Task description"
+    exit 1
+fi
+
+# Handle worklog file (skip in dry-run mode or --prompt)
+if [[ "$DRY_RUN" == false ]] && [[ "$OUTPUT_PROMPT" == false ]]; then
+    if [[ -f "$WORKLOG_FILE" ]]; then
+        if [[ "$RESET_WORKLOG" == true ]]; then
+            create_fresh_worklog
+            log_info "Reset ${WORKLOG_FILE}"
+        elif [[ "$KEEP_WORKLOG" == true ]]; then
+            log_info "Keeping existing ${WORKLOG_FILE}"
+        else
+            echo -e "${YELLOW}${WORKLOG_FILE} already exists.${RESET}"
+            echo ""
+            echo "  [k] Keep existing worklog and continue"
+            echo "  [r] Reset worklog and start fresh"
+            echo "  [q] Quit"
+            echo ""
+            read -p "Choice [k/r/q]: " -n 1 -r choice
+            echo ""
+            case $choice in
+                r|R)
+                    create_fresh_worklog
+                    log_info "Reset ${WORKLOG_FILE}"
+                    ;;
+                k|K)
+                    log_info "Keeping existing ${WORKLOG_FILE}"
+                    ;;
+                *)
+                    log_info "Cancelled"
+                    exit 0
+                    ;;
+            esac
+            echo ""
+        fi
+    else
+        create_fresh_worklog
+        log_info "Created ${WORKLOG_FILE}"
+    fi
+fi
+
+# Check for claude CLI (skip if just outputting prompt)
+if [[ "$OUTPUT_PROMPT" == false ]] && ! command -v claude &> /dev/null; then
+    log_error "claude CLI not found in PATH"
+    exit 1
+fi
+
+# Build the prompt
+RALPH_PROMPT="You are Ralph, an autonomous coding agent. Do exactly ONE task per iteration.
+
+## Execution Protocol
+
+1. Read ${BRIEF_FILE} for the first unchecked task ([ ]).
+2. Read ${WORKLOG_FILE} Learnings section for prior context.
+3. Execute that single task.
+4. Validate your work with tests/typecheck/linting.
+
+## Critical: Only Complete If All Validations Pass
+
+- If all validations PASS:
+  - Mark task complete in ${BRIEF_FILE} ([ ] → [x])
+  - Commit your changes with message: feat: [task description]
+  - Append what worked to ${WORKLOG_FILE}
+
+- If any validation fails:
+  - Leave task unmarked
+  - Skip commit
+  - Append what went wrong to ${WORKLOG_FILE} (so next iteration can learn)
+
+## Work Log Format
+
+Append to ${WORKLOG_FILE} using this format:
+
+## Iteration [N] - [Task Name]
+- What was implemented
+- Files changed
+- Learnings for future iterations:
+  - Patterns discovered
+  - Gotchas encountered
+  - Useful context
+---
+
+## Update CLAUDE.md (If Applicable)
+
+If you discover a reusable pattern that future work should know about:
+- Check if CLAUDE.md exists in the project root
+- Add patterns like: 'This codebase uses X for Y' or 'Always do Z when changing W'
+- Only add genuinely reusable knowledge, not task-specific details
+
+## End Condition
+
+Review ${BRIEF_FILE} after task completion:
+- If ALL tasks are [x], output exactly: ${COMPLETION_MARKER}
+- If tasks remain [ ], just end your response (next iteration will continue)"
+
+# Output prompt and exit if --prompt flag is set
+if [[ "$OUTPUT_PROMPT" == true ]]; then
+    echo -e "${BLUE}Ralph Prompt Output${RESET}"
+    echo ""
+    echo -e "${YELLOW}This is the prompt that ralph sends to claude in each iteration.${RESET}"
+    echo -e "${YELLOW}Copy and paste it into an interactive claude session to debug or test behavior.${RESET}"
+    echo ""
+    echo -e "${DIM}─── prompt start ───${RESET}"
+    echo ""
+    echo "$RALPH_PROMPT"
+    echo ""
+    echo -e "${DIM}─── prompt end ───${RESET}"
+    echo ""
+    echo -e "${YELLOW}Usage: Paste this prompt into 'claude' interactive mode to simulate a ralph iteration.${RESET}"
+    exit 0
+fi
+
+# Display banner and configuration (unless quiet mode)
+if [[ "$QUIET" == false ]]; then
+    echo ""
+    echo -e "${BLUE}  ██████╗   █████╗  ██╗     ██████╗  ██╗  ██╗${RESET}"
+    echo -e "${BLUE}  ██╔══██╗ ██╔══██╗ ██║     ██╔══██╗ ██║  ██║${RESET}"
+    echo -e "${GREEN}  ██████╔╝ ███████║ ██║     ██████╔╝ ███████║${RESET}"
+    echo -e "${GREEN}  ██╔══██╗ ██╔══██║ ██║     ██╔═══╝  ██╔══██║${RESET}"
+    echo -e "${YELLOW}  ██║  ██║ ██║  ██║ ███████╗██║      ██║  ██║${RESET}"
+    echo -e "${YELLOW}  ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚══════╝╚═╝      ╚═╝  ╚═╝${RESET}"
+    echo -e "${DIM}        Autonomous Coding Agent Loop${RESET}"
+    echo ""
+    log_info "Brief: ${BRIEF_FILE}"
+    log_info "Work Log: ${WORKLOG_FILE}"
+    if [[ "$NO_LIMIT" == true ]]; then
+        log_info "Max iterations: unlimited"
+    else
+        log_info "Max iterations: ${MAX_ITERATIONS}"
+    fi
+    if [[ "$NO_SLEEP" == true ]]; then
+        log_info "Sleep: disabled"
+    else
+        log_info "Sleep: ${SLEEP_SECONDS}s"
+    fi
+    [[ "$VERBOSE" == true ]] && log_info "Verbose: enabled"
+    echo ""
+fi
+
+# Main loop
+i=1
+while true; do
+    # Check iteration limit
+    if [[ "$NO_LIMIT" == false ]] && [[ $i -gt $MAX_ITERATIONS ]]; then
+        break
+    fi
+
+    # Fixed-width iteration box (width 30 inner content)
+    box_width=30
+
+    # Build content string to calculate padding based on plain text length
+    if [[ "$NO_LIMIT" == true ]]; then
+        content="Iteration $i"
+    else
+        content="Iteration $i of $MAX_ITERATIONS"
+    fi
+    content_len=${#content}
+    padding=$(( (box_width - content_len) / 2 ))
+    padding_right=$(( box_width - content_len - padding ))
+
+    # Generate horizontal line using bash-native printf (avoids seq command)
+    hline=$(printf '%*s' "$box_width" '' | tr ' ' '─')
+
+    echo -e "${BOLD}┌${hline}┐${RESET}"
+    printf "${BOLD}│%*s${YELLOW}%s${RESET}${BOLD}%*s│${RESET}\n" "$padding" "" "$content" "$padding_right" ""
+    echo -e "${BOLD}└${hline}┘${RESET}"
+    echo ""
+
+    # Dry-run mode: show what would be executed and exit
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${YELLOW}[DRY RUN]${RESET} Would execute claude with prompt:"
+        echo ""
+        prompt_preview="${RALPH_PROMPT:0:500}"
+        echo -e "${DIM}${prompt_preview}...${RESET}"
+        echo ""
+        if [[ "$NO_LIMIT" == true ]]; then
+            log_info "[DRY RUN] Would continue until completion"
+        else
+            remaining=$((MAX_ITERATIONS - 1))
+            log_info "[DRY RUN] Would continue for $remaining more iteration(s)"
+        fi
+        exit 0
+    fi
+
+    # Run claude and capture output
+    log_info "Working..."
+
+    # Verbose: log iteration start time and prompt preview
+    if [[ "$VERBOSE" == true ]]; then
+        log "Iteration $i started at $(date '+%Y-%m-%d %H:%M:%S')"
+        prompt_preview="${RALPH_PROMPT:0:200}"
+        log "Prompt (first 200 chars): ${prompt_preview}..."
+    fi
+
+    result=$(claude --dangerously-skip-permissions -p "$RALPH_PROMPT" 2>&1) && claude_exit=0 || claude_exit=$?
+
+    # Verbose: log exit code and result stats
+    if [[ "$VERBOSE" == true ]]; then
+        log "claude exit code: $claude_exit"
+        log "Result character count: ${#result}"
+        log "Iteration $i ended at $(date '+%Y-%m-%d %H:%M:%S')"
+    fi
+
+    if [[ $claude_exit -ne 0 ]]; then
+        log_error "claude command failed with exit code $claude_exit"
+        echo ""
+        echo -e "${DIM}─── Output ───${RESET}"
+        echo "$result"
+        echo -e "${DIM}──────────────${RESET}"
+        exit 1
+    fi
+
+    echo ""
+    echo -e "${DIM}─── Output ───${RESET}"
+    echo "$result"
+    echo -e "${DIM}──────────────${RESET}"
+
+    echo ""
+
+    if [[ "$result" == *"$COMPLETION_MARKER"* ]]; then
+        echo -e "${BOLD}${GREEN}╔════════════════════════════════════════╗${RESET}"
+        echo -e "${BOLD}${GREEN}║         ALL TASKS COMPLETE!            ║${RESET}"
+        echo -e "${BOLD}${GREEN}╚════════════════════════════════════════╝${RESET}"
+        echo ""
+        log_success "Finished after $i iteration(s)"
+        log_info "Review ${WORKLOG_FILE} for details"
+        exit 0
+    fi
+
+    # Sleep between iterations (unless disabled or last iteration)
+    if [[ "$NO_SLEEP" == false ]]; then
+        if [[ "$NO_LIMIT" == true ]] || [[ $i -lt $MAX_ITERATIONS ]]; then
+            [[ "$VERBOSE" == true ]] && log "Sleeping ${SLEEP_SECONDS}s before next iteration..."
+            sleep "$SLEEP_SECONDS"
+        fi
+    fi
+
+    ((i++))
+done
+
+echo ""
+echo -e "${BOLD}${YELLOW}╔════════════════════════════════════════╗${RESET}"
+echo -e "${BOLD}${YELLOW}║      MAX ITERATIONS REACHED            ║${RESET}"
+echo -e "${BOLD}${YELLOW}╚════════════════════════════════════════╝${RESET}"
+echo ""
+log_error "Reached max iterations (${MAX_ITERATIONS}) without completing all tasks"
+log_info "Check ${WORKLOG_FILE} for progress"
+log_info "Run again with: ralph -n $((MAX_ITERATIONS + 10))"
+exit 1
